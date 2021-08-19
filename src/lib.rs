@@ -6,16 +6,19 @@ use libp2p::{
     Multiaddr, Transport, TransportError,
 };
 
-pub struct MaybeUpgrade<TInner, TUpgrade> {
+#[derive(Debug, Clone)]
+pub struct MaybeUpgrade<TInner, TUpgrade, TUpgrader> {
     inner: TInner,
     _marker: PhantomData<TUpgrade>,
+    _marker_1: PhantomData<TUpgrader>,
 }
 
-impl<TInner, TUpgrade> MaybeUpgrade<TInner, TUpgrade> {
+impl<TInner, TUpgrade, TUpgrader> MaybeUpgrade<TInner, TUpgrade, TUpgrader> {
     pub fn new(inner: TInner) -> Self {
         Self {
             inner,
             _marker: Default::default(),
+            _marker_1: Default::default(),
         }
     }
 }
@@ -30,10 +33,11 @@ where
 }
 
 #[allow(clippy::type_complexity)]
-impl<TInner, TUpgrade> Transport for MaybeUpgrade<TInner, TUpgrade>
+impl<TInner, TUpgrade, TUpgrader> Transport for MaybeUpgrade<TInner, TUpgrade, TUpgrader>
 where
     TInner: Transport,
-    TUpgrade: UpgradeMaybe<TInner, TUpgrade> + Transport,
+    TUpgrade: Transport,
+    TUpgrader: UpgradeMaybe<TInner, TUpgrade> + Clone,
 {
     type Output = EitherOutput<TInner::Output, TUpgrade::Output>;
 
@@ -49,7 +53,7 @@ where
     type ListenerUpgrade = future::AndThen<
         TInner::ListenerUpgrade,
         future::Then<
-            TUpgrade::UpgradeFuture,
+            TUpgrader::UpgradeFuture,
             future::Ready<Result<Self::Output, Self::Error>>,
             fn(
                 Result<TUpgrade::Output, TInner::Output>,
@@ -58,7 +62,7 @@ where
         fn(
             TInner::Output,
         ) -> future::Then<
-            TUpgrade::UpgradeFuture,
+            TUpgrader::UpgradeFuture,
             future::Ready<Result<Self::Output, Self::Error>>,
             fn(
                 Result<TUpgrade::Output, TInner::Output>,
@@ -73,13 +77,12 @@ where
             self.inner
                 .listen_on(addr)?
                 .map_ok::<_, fn(_) -> _>(|event| {
+                    // TODO: also augment the listening events, e.g. listening on ../ws
                     event.map(|upgrade_fut| {
                         upgrade_fut.and_then::<_, fn(_) -> _>(|inner| {
-                            TUpgrade::try_upgrade(inner).then::<_, fn(_) -> _>(|res| {
-                                match res {
-                                    Err(inner) => future::ok(EitherOutput::First(inner)),
-                                    Ok(upgraded) => future::ok(EitherOutput::Second(upgraded)),
-                                }
+                            TUpgrader::try_upgrade(inner).then::<_, fn(_) -> _>(|res| match res {
+                                Err(inner) => future::ok(EitherOutput::First(inner)),
+                                Ok(upgraded) => future::ok(EitherOutput::Second(upgraded)),
                             })
                         })
                     })
