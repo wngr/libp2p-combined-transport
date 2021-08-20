@@ -33,7 +33,7 @@ where
     mk_outer: fn(ProxyTransport<TBase>) -> TOuter,
     proxy: ProxyTransport<TBase>,
     upgrader: MaybeUpgrade<TBase>,
-    map_base_addr_to_outer: fn(&Multiaddr) -> Multiaddr,
+    map_base_addr_to_outer: fn(Multiaddr) -> Multiaddr,
 }
 
 impl<TBase, TOuter> CombinedTransport<TBase, TOuter>
@@ -46,7 +46,7 @@ where
         base: TBase,
         mk_outer: fn(ProxyTransport<TBase>) -> TOuter,
         upgrader: MaybeUpgrade<TBase>,
-        map_base_addr_to_outer: fn(&Multiaddr) -> Multiaddr,
+        map_base_addr_to_outer: fn(Multiaddr) -> Multiaddr,
     ) -> Self {
         // TODO: Add comment
         let proxy = ProxyTransport::<TBase>::new(base.clone());
@@ -167,12 +167,11 @@ where
     where
         Self: Sized,
     {
-        let outer_addr = (self.map_base_addr_to_outer)(&addr);
         // 1. User calls `listen_on`
         // 2. Base transport `listen_on` -> returns `TBase::Listener`
         let base_listener = self
             .base
-            .listen_on(addr)
+            .listen_on(addr.clone())
             .map_err(|e| e.map(CombinedError::Base))?;
         // 3. Create new mpsc::channel, all events emitted by (2) will be cloned and piped into
         //    this tx, with the exception of the Upgrade event
@@ -182,7 +181,10 @@ where
         debug_assert!(x.is_none());
         // 5. Call listen_on on `TOuter`, which will call listen_on on proxy. Proxy returns tx from
         //    (4)
-        let outer_listener = self.outer.listen_on(outer_addr).expect("FIXME");
+        let outer_listener = self
+            .outer
+            .listen_on((self.map_base_addr_to_outer)(addr))
+            .map_err(|e| e.map(CombinedError::Outer))?;
         debug_assert!(self.proxy.pending.lock().is_none());
         // 6. Stream returned by (5) will be joined with the one from (2) and returned from the
         //    function
