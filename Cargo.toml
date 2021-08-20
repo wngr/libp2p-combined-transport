@@ -8,4 +8,5 @@ description = "libp2p transport to upgrade each incoming connection"
 repository = "https://github.com/wngr/libp2p-maybe-transport/"
 
 [dependencies]
+futures = "0.3.16"
 libp2p = { version = "0.39.1", default-features = false, features = [] }

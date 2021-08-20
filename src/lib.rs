@@ -1,5 +1,7 @@
 use std::marker::PhantomData;
 
+pub mod combined;
+
 use libp2p::{
     core::{either::EitherOutput, transport::ListenerEvent},
     futures::{future, stream, Future, FutureExt, TryFutureExt, TryStreamExt},
