@@ -1,4 +1,4 @@
-use std::{cell::RefCell, marker::PhantomData, rc::Rc, sync::Arc};
+use std::{cell::RefCell, fmt, marker::PhantomData, rc::Rc, sync::Arc};
 
 use futures::{
     channel::mpsc,
@@ -69,10 +69,38 @@ type MaybeUpgrade<TBase> =
     )
         -> BoxFuture<'static, Result<<TBase as Transport>::Output, <TBase as Transport>::Output>>;
 
-enum CombinedError<Base, Outer> {
+#[derive(Debug, Copy, Clone)]
+pub enum CombinedError<Base, Outer> {
     Custom,
     Base(Base),
     Outer(Outer),
+}
+impl<A, B> fmt::Display for CombinedError<A, B>
+where
+    A: fmt::Display,
+    B: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CombinedError::Base(a) => a.fmt(f),
+            CombinedError::Outer(b) => b.fmt(f),
+            CombinedError::Custom => write!(f, "Custom"),
+        }
+    }
+}
+
+impl<A, B> std::error::Error for CombinedError<A, B>
+where
+    A: std::error::Error,
+    B: std::error::Error,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            CombinedError::Base(a) => a.source(),
+            CombinedError::Outer(b) => b.source(),
+            CombinedError::Custom => None,
+        }
+    }
 }
 
 impl<TBase, TOuter> Transport for CombinedTransport<TBase, TOuter>
@@ -90,7 +118,7 @@ where
 {
     type Output = EitherOutput<TBase::Output, TOuter::Output>;
 
-    type Error = EitherError<TBase::Error, TOuter::Error>;
+    type Error = CombinedError<TBase::Error, TOuter::Error>;
 
     //type Listener = EitherListenStream<TBase::Listener, TOuter::Listener>;
     //type Listener: Stream<Item = Result<ListenerEvent<Self::ListenerUpgrade, Self::Error>, Self::Error>>;
@@ -109,7 +137,8 @@ where
     //type ListenerUpgrade = EitherFuture<TBase::ListenerUpgrade, TOuter::ListenerUpgrade>;
     //type ListenerUpgrade: Future<Output = Result<Self::Output, Self::Error>>;
     type ListenerUpgrade = BoxFuture<'static, Result<Self::Output, Self::Error>>;
-    type Dial = EitherFuture<TBase::Dial, TOuter::Dial>;
+    // FIXME DIAL
+    type Dial = BoxFuture<'static, Result<Self::Output, Self::Error>>;
 
     fn listen_on(
         self,
@@ -124,7 +153,7 @@ where
         let base_listener = self
             .base
             .listen_on(addr)
-            .map_err(|e| e.map(EitherError::A))?;
+            .map_err(|e| e.map(CombinedError::Base))?;
         // 3. Create new mpsc::channel, all events emitted by (2) will be cloned and piped into
         //    this tx, with the exception of the Upgrade event
         let (mut tx, rx) = mpsc::channel(256);
@@ -182,8 +211,9 @@ where
                                                     local_addr: local_addr_c,
                                                     remote_addr: remote_addr_c,
                                                 })
-                                                .expect("FIXME");
-                                                panic!("FIXME Create an custom error :-)");
+                                                .expect("FIXME infallible?!");
+                                                // FIXME add message or something
+                                                Err(CombinedError::Custom)
                                             }
                                             Err(u) => {
                                                 // continue
@@ -191,7 +221,7 @@ where
                                             }
                                         }
                                     }
-                                    Err(e) => Err(EitherError::A(e)),
+                                    Err(e) => Err(CombinedError::Base(e)),
                                 }
                             }
                             .boxed();
@@ -207,21 +237,21 @@ where
                         ListenerEvent::Error(e) => ListenerEvent::Error(e),
                     };
 
-                    ev.map_err(EitherError::A)
+                    ev.map_err(CombinedError::Base)
                 })
-                .map_err(EitherError::A)
+                .map_err(CombinedError::Base)
                 .boxed(),
             outer_listener
                 .map_ok(|ev| {
                     ev.map(|upgrade_fut| {
                         upgrade_fut
                             .map_ok(EitherOutput::Second)
-                            .map_err(EitherError::B)
+                            .map_err(CombinedError::Outer)
                             .boxed()
                     })
-                    .map_err(EitherError::B)
+                    .map_err(CombinedError::Outer)
                 })
-                .map_err(EitherError::B)
+                .map_err(CombinedError::Outer)
                 .boxed(),
         )
         .boxed();
