@@ -1,4 +1,4 @@
-use std::{cell::RefCell, marker::PhantomData, rc::Rc};
+use std::{cell::RefCell, marker::PhantomData, rc::Rc, sync::Arc};
 
 use futures::{
     channel::mpsc,
@@ -11,8 +11,9 @@ use libp2p::{
         either::{EitherError, EitherFuture, EitherListenStream, EitherOutput},
         transport::ListenerEvent,
     },
-    Transport,
+    Multiaddr, Transport,
 };
+use parking_lot::Mutex;
 
 /// Transport combining two transports. One of which is the base transport (like TCP), and another
 /// one is a higher-level transport (like WebSocket). Similar to [`OrTransport`], this tries to
@@ -24,21 +25,30 @@ use libp2p::{
 /// [`ProxyTransport`], with the exception of upgrades.
 ///
 /// [`peek`]: https://doc.rust-lang.org/std/net/struct.TcpStream.html#method.peek
-pub struct CombinedTransport<TBase: Transport + Clone, TOuter> {
+#[derive(Clone)]
+pub struct CombinedTransport<TBase: Transport + Clone, TOuter>
+where
+    TBase::Error: Send + 'static,
+    TBase::Output: 'static,
+{
     base: TBase,
     outer: TOuter,
     proxy: ProxyTransport<TBase>,
     upgrader: MaybeUpgrade<TBase>,
+    map_base_addr_to_outer: fn(&Multiaddr) -> Multiaddr,
 }
 
 impl<TBase, TOuter> CombinedTransport<TBase, TOuter>
 where
     TBase: Transport + Clone,
+    TBase::Error: Send + 'static,
+    TBase::Output: 'static,
 {
     pub fn new(
         base: TBase,
         outer: fn(ProxyTransport<TBase>) -> TOuter,
         upgrader: MaybeUpgrade<TBase>,
+        map_base_addr_to_outer: fn(&Multiaddr) -> Multiaddr,
     ) -> Self {
         let proxy = ProxyTransport::<TBase>::new();
         let outer = outer(proxy.clone());
@@ -47,19 +57,31 @@ where
             proxy,
             outer,
             upgrader,
+            map_base_addr_to_outer,
         }
     }
 }
 
-type MaybeUpgrade<TBase> = fn(&mut <TBase as Transport>::Output) -> bool;
+// TODO
+type MaybeUpgrade<TBase> =
+    fn(
+        <TBase as Transport>::Output,
+    )
+        -> BoxFuture<'static, Result<<TBase as Transport>::Output, <TBase as Transport>::Output>>;
+
+enum CombinedError<Base, Outer> {
+    Custom,
+    Base(Base),
+    Outer(Outer),
+}
 
 impl<TBase, TOuter> Transport for CombinedTransport<TBase, TOuter>
 where
     TBase: Transport + Clone,
     TBase::Listener: Send + 'static,
     TBase::ListenerUpgrade: Send + 'static,
-    TBase::Error: Clone + Send + 'static,
-    TBase::Output: 'static,
+    TBase::Error: Send + 'static,
+    TBase::Output: Send + 'static,
     TOuter: Transport,
     TOuter::Listener: Send + 'static,
     TOuter::ListenerUpgrade: Send + 'static,
@@ -96,87 +118,35 @@ where
     where
         Self: Sized,
     {
+        let outer_addr = (self.map_base_addr_to_outer)(&addr);
         // 1. User calls `listen_on`
         // 2. Base transport `listen_on` -> returns `TBase::Listener`
         let base_listener = self
             .base
-            .listen_on(addr.clone())
+            .listen_on(addr)
             .map_err(|e| e.map(EitherError::A))?;
         // 3. Create new mpsc::channel, all events emitted by (2) will be cloned and piped into
         //    this tx, with the exception of the Upgrade event
         let (mut tx, rx) = mpsc::channel(256);
         // 4. Move rx into the proxy
-        let x = self.proxy.pending.replace(Some(rx));
+        let x = self.proxy.pending.lock().replace(rx);
         debug_assert!(x.is_none());
         // 5. Call listen_on on `TOuter`, which will call listen_on on proxy. Proxy returns tx from
         //    (4)
-        let outer_listener = self.outer.listen_on(addr).expect("FIXME");
-        debug_assert!(self.proxy.pending.borrow().is_none());
+        let outer_listener = self.outer.listen_on(outer_addr).expect("FIXME");
+        debug_assert!(self.proxy.pending.lock().is_none());
         // 6. Stream returned by (5) will be joined with the one from (2) and returned from the
         //    function
         let upgrader = self.upgrader;
         let combined_listener = stream::select(
-            //            base_listener
-            //                .map_ok(move |ev| {
-            //                    let cloned = match &ev {
-            //                        ListenerEvent::NewAddress(a) => Some(ListenerEvent::NewAddress(a.clone())),
-            //                        ListenerEvent::AddressExpired(a) => {
-            //                            Some(ListenerEvent::AddressExpired(a.clone()))
-            //                        }
-            //                        ListenerEvent::Error(e) => Some(ListenerEvent::Error(e.clone())),
-            //                        ListenerEvent::Upgrade { .. } => None,
-            //                    };
-            //                    if let Some(ev) = cloned {
-            //                        tx.start_send(ev).unwrap();
-            //                    }
-            //                    ev.map(|upgrade_fut|
-            //                        async move {
-            //                        match upgrade_fut.await {
-            //Ok(u) => {
-            //
-            //
-            //
-            //                                // We could try to upgrade here; if it works, we emit an
-            //                                // error for the base transport, and send the whole event over to
-            //                                // the outer transport via `tx`. If the upgrade fails, we just
-            //                                // continue.
-            //                                if upgrader(&mut u) {
-            //                                    // yay to outer
-            //                                } else {
-            //                                    // continue
-            //                                }
-            //                                Ok(EitherOutput::First(u))
-            //},
-            //
-            //                            Err(e) => Err(EitherError::A(e))
-            //}
-
-            //                       }.boxed()
-            //)
-
-            //            .map_err(|e| EitherError::A(e))
-            //           .boxed()
-            //                    })
-            //                   .map_err(EitherError::A)
-            //})
-            //                       {
-            //                           upgrade_fut
-            //                            .map_ok(EitherOutput::Second)
-            //                            .map_err(|e| EitherError::A(e))
-            //                            .boxed()
-            //                       }
-            //                            .map_err(|e| EitherError::A(e))
-            //                )
-            //                .map_err(EitherError::A)
-            //                .boxed(),
             base_listener
-                .map_ok(move |mut ev| {
+                .map_ok(move |ev| {
                     let cloned = match &ev {
                         ListenerEvent::NewAddress(a) => Some(ListenerEvent::NewAddress(a.clone())),
                         ListenerEvent::AddressExpired(a) => {
                             Some(ListenerEvent::AddressExpired(a.clone()))
                         }
-                        ListenerEvent::Error(e) => Some(ListenerEvent::Error(e.clone())),
+                        ListenerEvent::Error(e) => None, // TODO MAYBE?//Some(ListenerEvent::Error(e.clone())),
                         ListenerEvent::Upgrade { .. } => None,
                     };
                     if let Some(ev) = cloned {
@@ -194,26 +164,31 @@ where
                             let upgrade = async move {
                                 match upgrade.await {
                                     Ok(mut u) => {
-                                        let mut u: TBase::Output = u;
                                         // We could try to upgrade here; if it works, we emit an
                                         // error for the base transport, and send the whole event over to
                                         // the outer transport via `tx`. If the upgrade fails, we just
                                         // continue.
-                                        if upgrader(&mut u) {
-                                            // yay to outer
-                                            tx_c.start_send(ListenerEvent::Upgrade {
-                                                // FUCK!
-                                                // TBase::ListenerUpgrade is generic
-                                                // Maybe this can be TransportProxy::Output?
-                                                upgrade: todo!(), // future::ok(u).boxed(),
-                                                local_addr: local_addr_c,
-                                                remote_addr: remote_addr_c,
-                                            })
-                                            .expect("FIXME");
-                                            panic!("FIXME Create an custom error :-)");
-                                        } else {
-                                            // continue
-                                            Ok(EitherOutput::First(u))
+
+                                        match upgrader(u).await {
+                                            Ok(u) => {
+                                                // yay to outer
+                                                tx_c.start_send(ListenerEvent::Upgrade {
+                                                    // FUCK!
+                                                    // TBase::ListenerUpgrade is generic
+                                                    // Maybe this can be TransportProxy::Output?
+                                                    // ok, so the type of `tx` needs to be modified to
+                                                    // accomodate the types of ProxyTransport
+                                                    upgrade: future::ok(u).boxed(),
+                                                    local_addr: local_addr_c,
+                                                    remote_addr: remote_addr_c,
+                                                })
+                                                .expect("FIXME");
+                                                panic!("FIXME Create an custom error :-)");
+                                            }
+                                            Err(u) => {
+                                                // continue
+                                                Ok(EitherOutput::First(u))
+                                            }
                                         }
                                     }
                                     Err(e) => Err(EitherError::A(e)),
@@ -232,32 +207,7 @@ where
                         ListenerEvent::Error(e) => ListenerEvent::Error(e),
                     };
 
-                    ev
-                        //                    ev.map(|upgrade_fut| {
-                        //                        async move {
-                        //                            match upgrade_fut.await {
-                        //                                Ok(mut u) => {
-                        //                                    // We could try to upgrade here; if it works, we emit an
-                        //                                    // error for the base transport, and send the whole event over to
-                        //                                    // the outer transport via `tx`. If the upgrade fails, we just
-                        //                                    // continue.
-                        //                                    if upgrader(&mut u) {
-                        //                                        // yay to outer
-                        //                                    } else {
-                        //                                        // continue
-                        //                                    }
-                        //                                    Ok(EitherOutput::First(u))
-                        //                                }
-                        //                                Err(e) => Err(EitherError::A(e)),
-                        //                            }
-                        //                        }
-                        //                        .boxed()
-                        //                        //                        upgrade_fut
-                        //                        //                            .map_ok(EitherOutput::First)
-                        //                        //                            .map_err(EitherError::A)
-                        //                        //                            .boxed()
-                        //                    })
-                        .map_err(EitherError::A)
+                    ev.map_err(EitherError::A)
                 })
                 .map_err(EitherError::A)
                 .boxed(),
@@ -299,14 +249,26 @@ where
     }
 }
 
-pub struct ProxyTransport<TBase: Transport> {
+pub struct ProxyTransport<TBase: Transport>
+where
+    Self: Transport,
+{
     _marker: PhantomData<TBase>,
-    pending:
-        Rc<RefCell<Option<mpsc::Receiver<ListenerEvent<TBase::ListenerUpgrade, TBase::Error>>>>>,
+    pending: Arc<
+        Mutex<
+            Option<
+                mpsc::Receiver<
+                    ListenerEvent<<Self as Transport>::ListenerUpgrade, <Self as Transport>::Error>,
+                >,
+            >,
+        >,
+    >,
 }
 impl<TBase> Clone for ProxyTransport<TBase>
 where
     TBase: Transport + Clone,
+    TBase::Output: 'static,
+    TBase::Error: Send + 'static,
 {
     fn clone(&self) -> Self {
         Self {
@@ -319,6 +281,8 @@ where
 impl<TBase> ProxyTransport<TBase>
 where
     TBase: Transport + Clone,
+    TBase::Output: 'static,
+    TBase::Error: Send + 'static,
 {
     fn new() -> Self {
         Self {
@@ -331,14 +295,19 @@ where
 impl<TBase> Transport for ProxyTransport<TBase>
 where
     TBase: Transport + Clone,
+    TBase::Output: 'static,
+    TBase::Error: Send + 'static,
 {
     type Output = TBase::Output;
 
     type Error = TBase::Error;
 
-    type Listener = TBase::Listener;
+    //type Listener = TBase::Listener;
+    type Listener =
+        BoxStream<'static, Result<ListenerEvent<Self::ListenerUpgrade, Self::Error>, Self::Error>>;
 
-    type ListenerUpgrade = TBase::ListenerUpgrade;
+    //    type ListenerUpgrade: Future<Output = Result<Self::Output, Self::Error>>;
+    type ListenerUpgrade = BoxFuture<'static, Result<Self::Output, Self::Error>>;
 
     type Dial = TBase::Dial;
 
@@ -349,7 +318,12 @@ where
     where
         Self: Sized,
     {
-        todo!()
+        let listener = self
+            .pending
+            .lock()
+            .take()
+            .expect("Only called after successful base listen");
+        Ok(listener.map(Ok).boxed())
     }
 
     fn dial(
