@@ -1,4 +1,5 @@
-use std::{cell::RefCell, fmt, marker::PhantomData, rc::Rc, sync::Arc};
+#![allow(clippy::type_complexity)]
+use std::{fmt, marker::PhantomData, sync::Arc};
 
 use futures::{
     channel::mpsc,
@@ -7,11 +8,8 @@ use futures::{
     FutureExt, StreamExt, TryFutureExt, TryStreamExt,
 };
 use libp2p::{
-    core::{
-        either::{EitherError, EitherFuture, EitherListenStream, EitherOutput},
-        transport::ListenerEvent,
-    },
-    Multiaddr, Transport,
+    core::{either::EitherOutput, transport::ListenerEvent},
+    Multiaddr, Transport, TransportError,
 };
 use parking_lot::Mutex;
 
@@ -50,7 +48,7 @@ where
         upgrader: MaybeUpgrade<TBase>,
         map_base_addr_to_outer: fn(&Multiaddr) -> Multiaddr,
     ) -> Self {
-        let proxy = ProxyTransport::<TBase>::new();
+        let proxy = ProxyTransport::<TBase>::new(base.clone());
         let outer = outer(proxy.clone());
         Self {
             base,
@@ -110,11 +108,13 @@ where
     TBase::ListenerUpgrade: Send + 'static,
     TBase::Error: Send + 'static,
     TBase::Output: Send + 'static,
+    TBase::Dial: Send + 'static,
     TOuter: Transport,
     TOuter::Listener: Send + 'static,
     TOuter::ListenerUpgrade: Send + 'static,
     TOuter::Error: 'static,
     TOuter::Output: 'static,
+    TOuter::Dial: Send + 'static,
 {
     type Output = EitherOutput<TBase::Output, TOuter::Output>;
 
@@ -147,6 +147,7 @@ where
     where
         Self: Sized,
     {
+        // TODO: Route this via proxy! ???
         let outer_addr = (self.map_base_addr_to_outer)(&addr);
         // 1. User calls `listen_on`
         // 2. Base transport `listen_on` -> returns `TBase::Listener`
@@ -175,7 +176,7 @@ where
                         ListenerEvent::AddressExpired(a) => {
                             Some(ListenerEvent::AddressExpired(a.clone()))
                         }
-                        ListenerEvent::Error(e) => None, // TODO MAYBE?//Some(ListenerEvent::Error(e.clone())),
+                        ListenerEvent::Error(_) => None, // Error is only propagated once, namely for the base transport
                         ListenerEvent::Upgrade { .. } => None,
                     };
                     if let Some(ev) = cloned {
@@ -192,12 +193,11 @@ where
                             let mut tx_c = tx.clone();
                             let upgrade = async move {
                                 match upgrade.await {
-                                    Ok(mut u) => {
+                                    Ok(u) => {
                                         // We could try to upgrade here; if it works, we emit an
                                         // error for the base transport, and send the whole event over to
                                         // the outer transport via `tx`. If the upgrade fails, we just
                                         // continue.
-
                                         match upgrader(u).await {
                                             Ok(u) => {
                                                 // yay to outer
@@ -267,7 +267,33 @@ where
     where
         Self: Sized,
     {
-        todo!()
+        let addr = match self.outer.dial(addr) {
+            Ok(connec) => {
+                return Ok(connec
+                    .map_ok(EitherOutput::Second)
+                    .map_err(CombinedError::Outer)
+                    .boxed())
+            }
+            Err(TransportError::MultiaddrNotSupported(addr)) => addr,
+            Err(TransportError::Other(err)) => {
+                return Err(TransportError::Other(CombinedError::Outer(err)))
+            }
+        };
+
+        let addr = match self.base.dial(addr) {
+            Ok(connec) => {
+                return Ok(connec
+                    .map_ok(EitherOutput::First)
+                    .map_err(CombinedError::Base)
+                    .boxed())
+            }
+            Err(TransportError::MultiaddrNotSupported(addr)) => addr,
+            Err(TransportError::Other(err)) => {
+                return Err(TransportError::Other(CombinedError::Base(err)))
+            }
+        };
+
+        Err(TransportError::MultiaddrNotSupported(addr))
     }
 
     fn address_translation(
@@ -275,7 +301,8 @@ where
         listen: &libp2p::Multiaddr,
         observed: &libp2p::Multiaddr,
     ) -> Option<libp2p::Multiaddr> {
-        todo!()
+        // Outer probably will call proxy, which will proxy to base
+        self.outer.address_translation(listen, observed)
     }
 }
 
@@ -284,6 +311,7 @@ where
     Self: Transport,
 {
     _marker: PhantomData<TBase>,
+    // 1-1 relation between [`CombinedTransport`] and [`ProxyTransport`]
     pending: Arc<
         Mutex<
             Option<
@@ -293,7 +321,11 @@ where
             >,
         >,
     >,
+    // Clone of TBase for dialing
+    base: TBase,
 }
+
+// TODO: simplify all those trait bounds
 impl<TBase> Clone for ProxyTransport<TBase>
 where
     TBase: Transport + Clone,
@@ -303,7 +335,8 @@ where
     fn clone(&self) -> Self {
         Self {
             _marker: Default::default(),
-            pending: self.pending.clone(),
+            pending: Default::default(), // TODO: is this correct?
+            base: self.base.clone(),
         }
     }
 }
@@ -314,10 +347,11 @@ where
     TBase::Output: 'static,
     TBase::Error: Send + 'static,
 {
-    fn new() -> Self {
+    fn new(base: TBase) -> Self {
         Self {
             pending: Default::default(),
             _marker: Default::default(),
+            base,
         }
     }
 }
@@ -343,7 +377,7 @@ where
 
     fn listen_on(
         self,
-        addr: libp2p::Multiaddr,
+        _addr: libp2p::Multiaddr,
     ) -> Result<Self::Listener, libp2p::TransportError<Self::Error>>
     where
         Self: Sized,
@@ -363,7 +397,7 @@ where
     where
         Self: Sized,
     {
-        todo!()
+        self.base.dial(addr)
     }
 
     fn address_translation(
@@ -371,6 +405,6 @@ where
         listen: &libp2p::Multiaddr,
         observed: &libp2p::Multiaddr,
     ) -> Option<libp2p::Multiaddr> {
-        todo!()
+        self.base.address_translation(listen, observed)
     }
 }
