@@ -23,7 +23,6 @@ use parking_lot::Mutex;
 /// [`ProxyTransport`], with the exception of upgrades.
 ///
 /// [`peek`]: https://doc.rust-lang.org/std/net/struct.TcpStream.html#method.peek
-#[derive(Clone)]
 pub struct CombinedTransport<TBase: Transport + Clone, TOuter>
 where
     TBase::Error: Send + 'static,
@@ -31,6 +30,7 @@ where
 {
     base: TBase,
     outer: TOuter,
+    mk_outer: fn(ProxyTransport<TBase>) -> TOuter,
     proxy: ProxyTransport<TBase>,
     upgrader: MaybeUpgrade<TBase>,
     map_base_addr_to_outer: fn(&Multiaddr) -> Multiaddr,
@@ -44,19 +44,39 @@ where
 {
     pub fn new(
         base: TBase,
-        outer: fn(ProxyTransport<TBase>) -> TOuter,
+        mk_outer: fn(ProxyTransport<TBase>) -> TOuter,
         upgrader: MaybeUpgrade<TBase>,
         map_base_addr_to_outer: fn(&Multiaddr) -> Multiaddr,
     ) -> Self {
+        // TODO: Add comment
         let proxy = ProxyTransport::<TBase>::new(base.clone());
-        let outer = outer(proxy.clone());
+        let mut proxy_clone = proxy.clone();
+        proxy_clone.pending = proxy.pending.clone();
+        let outer = mk_outer(proxy_clone);
         Self {
             base,
             proxy,
             outer,
+            // TODO: maybe use a trait?
+            mk_outer,
             upgrader,
             map_base_addr_to_outer,
         }
+    }
+}
+impl<TBase, TOuter> Clone for CombinedTransport<TBase, TOuter>
+where
+    TBase: Transport + Clone,
+    TBase::Error: Send + 'static,
+    TBase::Output: 'static,
+{
+    fn clone(&self) -> Self {
+        Self::new(
+            self.base.clone(),
+            self.mk_outer.clone(),
+            self.upgrader.clone(),
+            self.map_base_addr_to_outer.clone(),
+        )
     }
 }
 
@@ -147,7 +167,6 @@ where
     where
         Self: Sized,
     {
-        // TODO: Route this via proxy! ???
         let outer_addr = (self.map_base_addr_to_outer)(&addr);
         // 1. User calls `listen_on`
         // 2. Base transport `listen_on` -> returns `TBase::Listener`
@@ -312,7 +331,7 @@ where
 {
     _marker: PhantomData<TBase>,
     // 1-1 relation between [`CombinedTransport`] and [`ProxyTransport`]
-    pending: Arc<
+    pub(crate) pending: Arc<
         Mutex<
             Option<
                 mpsc::Receiver<
