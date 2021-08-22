@@ -1,10 +1,10 @@
 [package]
-name = "libp2p-maybe-transport"
-version = "0.1.2"
+name = "libp2p-combined-transport"
+version = "0.1.0"
 edition = "2018"
 authors = ["Oliver Wangler <oliver@wngr.de>"]
 license = "MIT OR Apache-2.0"
-description = "libp2p transport to upgrade each incoming connection"
+description = "libp2p combined transport"
 repository = "https://github.com/wngr/libp2p-maybe-transport/"
 
 [dependencies]
