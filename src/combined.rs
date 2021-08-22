@@ -23,16 +23,17 @@ use parking_lot::Mutex;
 /// [`ProxyTransport`], with the exception of upgrades.
 ///
 /// [`peek`]: https://doc.rust-lang.org/std/net/struct.TcpStream.html#method.peek
-pub struct CombinedTransport<TBase: Transport + Clone, TOuter>
+pub struct CombinedTransport<TBase, TOuter>
 where
+    TBase: Transport + Clone,
     TBase::Error: Send + 'static,
     TBase::Output: 'static,
 {
     base: TBase,
     outer: TOuter,
-    mk_outer: fn(ProxyTransport<TBase>) -> TOuter,
+    construct_outer: fn(ProxyTransport<TBase>) -> TOuter,
     proxy: ProxyTransport<TBase>,
-    upgrader: MaybeUpgrade<TBase>,
+    try_upgrade: MaybeUpgrade<TBase>,
     map_base_addr_to_outer: fn(Multiaddr) -> Multiaddr,
 }
 
@@ -44,22 +45,20 @@ where
 {
     pub fn new(
         base: TBase,
-        mk_outer: fn(ProxyTransport<TBase>) -> TOuter,
-        upgrader: MaybeUpgrade<TBase>,
+        construct_outer: fn(ProxyTransport<TBase>) -> TOuter,
+        try_upgrade: MaybeUpgrade<TBase>,
         map_base_addr_to_outer: fn(Multiaddr) -> Multiaddr,
     ) -> Self {
-        // TODO: Add comment
         let proxy = ProxyTransport::<TBase>::new(base.clone());
         let mut proxy_clone = proxy.clone();
         proxy_clone.pending = proxy.pending.clone();
-        let outer = mk_outer(proxy_clone);
+        let outer = construct_outer(proxy_clone);
         Self {
             base,
             proxy,
             outer,
-            // TODO: maybe use a trait?
-            mk_outer,
-            upgrader,
+            construct_outer,
+            try_upgrade,
             map_base_addr_to_outer,
         }
     }
@@ -73,14 +72,13 @@ where
     fn clone(&self) -> Self {
         Self::new(
             self.base.clone(),
-            self.mk_outer.clone(),
-            self.upgrader.clone(),
-            self.map_base_addr_to_outer.clone(),
+            self.construct_outer,
+            self.try_upgrade,
+            self.map_base_addr_to_outer,
         )
     }
 }
 
-// TODO
 type MaybeUpgrade<TBase> =
     fn(
         <TBase as Transport>::Output,
@@ -89,7 +87,7 @@ type MaybeUpgrade<TBase> =
 
 #[derive(Debug, Copy, Clone)]
 pub enum CombinedError<Base, Outer> {
-    Custom,
+    UpgradedToOuterTransport,
     Base(Base),
     Outer(Outer),
 }
@@ -102,7 +100,7 @@ where
         match self {
             CombinedError::Base(a) => a.fmt(f),
             CombinedError::Outer(b) => b.fmt(f),
-            CombinedError::Custom => write!(f, "Custom"),
+            CombinedError::UpgradedToOuterTransport => write!(f, "Upgraded to outer transport"),
         }
     }
 }
@@ -116,7 +114,7 @@ where
         match self {
             CombinedError::Base(a) => a.source(),
             CombinedError::Outer(b) => b.source(),
-            CombinedError::Custom => None,
+            CombinedError::UpgradedToOuterTransport => None,
         }
     }
 }
@@ -140,10 +138,7 @@ where
 
     type Error = CombinedError<TBase::Error, TOuter::Error>;
 
-    //type Listener = EitherListenStream<TBase::Listener, TOuter::Listener>;
-    //type Listener: Stream<Item = Result<ListenerEvent<Self::ListenerUpgrade, Self::Error>, Self::Error>>;
     // TODO remove box
-    //type Listener: Stream<Item = Result<ListenerEvent<Self::ListenerUpgrade, Self::Error>, Self::Error>>;
     type Listener = BoxStream<
         'static,
         Result<
@@ -152,12 +147,7 @@ where
             Self::Error,
         >,
     >;
-    //    type ListenerUpgrade =
-    // BoxFuture<'static, Either<TBase::ListenerUpgrade, TOuter::ListenerUpgrade>>;
-    //type ListenerUpgrade = EitherFuture<TBase::ListenerUpgrade, TOuter::ListenerUpgrade>;
-    //type ListenerUpgrade: Future<Output = Result<Self::Output, Self::Error>>;
     type ListenerUpgrade = BoxFuture<'static, Result<Self::Output, Self::Error>>;
-    // FIXME DIAL
     type Dial = BoxFuture<'static, Result<Self::Output, Self::Error>>;
 
     fn listen_on(
@@ -188,7 +178,7 @@ where
         debug_assert!(self.proxy.pending.lock().is_none());
         // 6. Stream returned by (5) will be joined with the one from (2) and returned from the
         //    function
-        let upgrader = self.upgrader;
+        let upgrader = self.try_upgrade;
         let combined_listener = stream::select(
             base_listener
                 .map_ok(move |ev| {
@@ -232,9 +222,8 @@ where
                                                     local_addr: local_addr_c,
                                                     remote_addr: remote_addr_c,
                                                 })
-                                                .expect("FIXME infallible?!");
-                                                // FIXME add message or something
-                                                Err(CombinedError::Custom)
+                                                .expect("Out of sync with proxy");
+                                                Err(CombinedError::UpgradedToOuterTransport)
                                             }
                                             Err(u) => {
                                                 // continue
@@ -277,7 +266,6 @@ where
         )
         .boxed();
         // 7. On an upgrade, check the switch, and route it either via outer or directly out
-        // TODO!
         Ok(combined_listener)
     }
 
@@ -323,11 +311,13 @@ where
         observed: &libp2p::Multiaddr,
     ) -> Option<libp2p::Multiaddr> {
         // Outer probably will call proxy, which will proxy to base
-        self.outer.address_translation(listen, observed)
+        self.outer
+            .address_translation(listen, observed)
+            .or_else(|| self.base.address_translation(listen, observed))
     }
 }
 
-pub struct ProxyTransport<TBase: Transport>
+pub struct ProxyTransport<TBase>
 where
     Self: Transport,
 {
@@ -356,7 +346,7 @@ where
     fn clone(&self) -> Self {
         Self {
             _marker: Default::default(),
-            pending: Default::default(), // TODO: is this correct?
+            pending: Default::default(),
             base: self.base.clone(),
         }
     }
@@ -387,11 +377,9 @@ where
 
     type Error = TBase::Error;
 
-    //type Listener = TBase::Listener;
     type Listener =
         BoxStream<'static, Result<ListenerEvent<Self::ListenerUpgrade, Self::Error>, Self::Error>>;
 
-    //    type ListenerUpgrade: Future<Output = Result<Self::Output, Self::Error>>;
     type ListenerUpgrade = BoxFuture<'static, Result<Self::Output, Self::Error>>;
 
     type Dial = TBase::Dial;
