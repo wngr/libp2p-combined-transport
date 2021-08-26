@@ -5,7 +5,7 @@ edition = "2018"
 authors = ["Oliver Wangler <oliver@wngr.de>"]
 license = "MIT OR Apache-2.0"
 description = "libp2p combined transport"
-repository = "https://github.com/wngr/libp2p-maybe-transport/"
+repository = "https://github.com/wngr/libp2p-combined-transport/"
 
 [dependencies]
 futures = "0.3.16"
