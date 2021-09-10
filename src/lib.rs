@@ -23,16 +23,22 @@ use parking_lot::Mutex;
 /// [`ProxyTransport`], with the exception of upgrades.
 ///
 /// [`peek`]: https://doc.rust-lang.org/std/net/struct.TcpStream.html#method.peek
+///
+/// For a usage example, have a loot at the [TCP-Websocket example](https://github.com/wngr/libp2p-combined-transport/tree/master/examples/tcp-websocket.rs).
 pub struct CombinedTransport<TBase, TOuter>
 where
     TBase: Transport + Clone,
     TBase::Error: Send + 'static,
     TBase::Output: 'static,
 {
+    /// The base transport
     base: TBase,
+    /// The outer transport, wrapping the base transport
     outer: TOuter,
+    /// Function pointer to construct the outer transport, given the base transport
     construct_outer: fn(ProxyTransport<TBase>) -> TOuter,
     proxy: ProxyTransport<TBase>,
+    /// Function pointer to try upgrading the base transport to the outer transport
     try_upgrade: MaybeUpgrade<TBase>,
     map_base_addr_to_outer: fn(Multiaddr) -> Multiaddr,
 }
@@ -43,6 +49,10 @@ where
     TBase::Error: Send + 'static,
     TBase::Output: 'static,
 {
+    /// Construct a new combined transport, given a base transport, a function to construct the
+    /// outer transport given the base transport, a function to try the upgrade to the outer
+    /// transport given incoming base connections, and a function to map base addresses to outer
+    /// addresses (if necessary).
     pub fn new(
         base: TBase,
         construct_outer: fn(ProxyTransport<TBase>) -> TOuter,
@@ -138,15 +148,8 @@ where
 
     type Error = CombinedError<TBase::Error, TOuter::Error>;
 
-    // TODO remove box
-    type Listener = BoxStream<
-        'static,
-        Result<
-            //ListenerEvent<Either<TBase::ListenerUpgrade, TOuter::ListenerUpgrade>, Self::Error>,
-            ListenerEvent<Self::ListenerUpgrade, Self::Error>,
-            Self::Error,
-        >,
-    >;
+    type Listener =
+        BoxStream<'static, Result<ListenerEvent<Self::ListenerUpgrade, Self::Error>, Self::Error>>;
     type ListenerUpgrade = BoxFuture<'static, Result<Self::Output, Self::Error>>;
     type Dial = BoxFuture<'static, Result<Self::Output, Self::Error>>;
 
