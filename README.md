@@ -19,4 +19,4 @@ upgrades.
 [`peek`]: https://doc.rust-lang.org/std/net/struct.TcpStream.html#method.peek
 
 
-For a usage example, have a loot at the [TCP-Websocket example](https://github.com/wngr/libp2p-combined-transport/tree/master/examples/tcp-websocket.rs).
+For a usage example, have a look at the [TCP-Websocket example](https://github.com/wngr/libp2p-combined-transport/tree/master/examples/tcp-websocket.rs).
